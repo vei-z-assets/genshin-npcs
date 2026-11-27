@@ -7,54 +7,31 @@ import tempfile
 TARGET_DIR = r"C:\Users\veizou\vei-z\public\content\genshin\npc"
 # ---------------------
 
-def get_best_diffuse_match(mat_name, diffuse_textures):
-    """Scores each _Diffuse texture against the material name to find the exact part match."""
-    # Safely grab the base material name without '.001' using partition
-    base_mat, _, _ = mat_name.lower().partition(".")
-    
-    ignore_words = {"mi", "m", "mat", "material", "avatar", "npc", "tex", "diffuse", "instance"}
-    mat_tokens = [w for w in base_mat.replace("-", "_").split("_") if w not in ignore_words and len(w) > 1]
-
-    best_path = None
-    best_score = -1
-
-    for tex_name, tex_path in diffuse_textures.items():
-        score = 0
-        for token in mat_tokens:
-            if token in tex_name:
-                score += len(token)
-        if score > best_score:
-            best_score = score
-            best_path = tex_path
-
-    return best_path
-
-def fix_materials_and_uvs(search_folder):
-    """Finds _Diffuse textures, matches them by part name, and enforces primary UV0."""
-    diffuse_textures = {}
-    for root, dirs, files in os.walk(search_folder):
-        for file in files:
-            lower_name = file.lower()
-            if lower_name.endswith((".png", ".tga", ".jpg", ".dds")):
-                if "diffuse" in lower_name and "diffuse_a" not in lower_name:
-                    diffuse_textures[lower_name] = os.path.join(root, file)
-
-    if not diffuse_textures:
-        return
-
-    # 1. Ensure primary UV channel (index 0) is active on all meshes
+def keep_only_diffuse():
+    """Keeps the exact Diffuse image already assigned by the FBX, removing broken alpha/specular links."""
+    # Ensure primary UV map is active
     for obj in bpy.data.objects:
         if obj.type == 'MESH' and obj.data.uv_layers:
             obj.data.uv_layers.active_index = 0
 
-    # 2. Rebuild each material with its matched Diffuse texture
     for mat in bpy.data.materials:
         if not mat.use_nodes:
-            mat.use_nodes = True
+            continue
 
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
 
+        # Grab the exact image the FBX already linked to this material
+        existing_image = None
+        for node in nodes:
+            if node.type == 'TEX_IMAGE' and node.image:
+                existing_image = node.image
+                break
+
+        if not existing_image:
+            continue
+
+        # Rebuild a clean Principled BSDF using ONLY that exact Diffuse image
         nodes.clear()
         bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
         output = nodes.new(type='ShaderNodeOutputMaterial')
@@ -62,15 +39,14 @@ def fix_materials_and_uvs(search_folder):
 
         if 'Roughness' in bsdf.inputs:
             bsdf.inputs['Roughness'].default_value = 0.85
+        if 'Specular IOR Level' in bsdf.inputs:
+            bsdf.inputs['Specular IOR Level'].default_value = 0.0
 
-        matched_tex_path = get_best_diffuse_match(mat.name, diffuse_textures)
+        tex_node = nodes.new(type='ShaderNodeTexImage')
+        tex_node.image = existing_image
+        links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
 
-        if matched_tex_path:
-            tex_node = nodes.new(type='ShaderNodeTexImage')
-            tex_node.image = bpy.data.images.load(matched_tex_path)
-            links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
-
-def convert_fbx_list(fbx_files, search_folder, out_folder, folder_name):
+def convert_fbx_list(fbx_files, out_folder, folder_name):
     total_fbx = len(fbx_files)
     for index, fbx_path in enumerate(fbx_files, start=1):
         glb_name = str(index) if total_fbx > 1 else folder_name
@@ -78,7 +54,7 @@ def convert_fbx_list(fbx_files, search_folder, out_folder, folder_name):
 
         bpy.ops.wm.read_factory_settings(use_empty=True)
         bpy.ops.import_scene.fbx(filepath=fbx_path)
-        fix_materials_and_uvs(search_folder)
+        keep_only_diffuse()
         bpy.ops.export_scene.gltf(filepath=glb_path, export_format='GLB')
 
 def process_in_place():
@@ -89,7 +65,7 @@ def process_in_place():
         zip_files = [f for f in sorted(files) if f.lower().endswith(".zip")]
 
         if fbx_files:
-            convert_fbx_list(fbx_files, root, root, folder_name)
+            convert_fbx_list(fbx_files, root, folder_name)
             print(f"Updated (from loose files): {folder_name}")
         elif zip_files:
             first_zip = next(iter(zip_files))
@@ -105,7 +81,7 @@ def process_in_place():
                             zip_fbx.append(os.path.join(z_root, file))
 
                 if zip_fbx:
-                    convert_fbx_list(zip_fbx, temp_dir, root, folder_name)
+                    convert_fbx_list(zip_fbx, root, folder_name)
                     print(f"Updated (from ZIP): {folder_name}")
 
 if __name__ == "__main__":
